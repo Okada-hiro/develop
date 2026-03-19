@@ -1,0 +1,65 @@
+# develop
+
+Step 1 の開始点として、`whisper-large-v3` を使う ASR スクリプトを追加しています。
+
+## 使い方
+
+依存関係がまだ入っていなければ、リポジトリ直下で次を実行します。
+
+```bash
+pip install -e ./whisper
+```
+
+ASR の実行例:
+
+```bash
+python3 develop/asr_whisper_large_v3.py /path/to/audio.wav --language ja --word-timestamps
+```
+
+トークン候補の確率も欲しい場合:
+
+```bash
+python3 develop/asr_whisper_large_v3.py /path/to/audio.wav --language ja --word-timestamps --token-topk 5
+```
+
+`develop/output/` に以下を保存します。
+
+- `*.txt`: 全文テキスト
+- `*.json`: `segments` を含む詳細結果
+
+`--token-topk 5` を付けた場合、各 `segment` に `token_probs` を追加します。
+各トークンについて、選ばれたトークンの確率と top-k 候補を保存します。
+
+## pyannote
+
+`pyannote.audio` を使う処理は Hugging Face のトークンが必要です。
+事前に対象モデルの利用条件に同意したうえで、`HUGGINGFACE_HUB_TOKEN` を設定してください。
+
+VAD で 30 秒前後のチャンクを作る:
+
+```bash
+python3 develop/pyannote_vad_segmenter.py /path/to/audio.wav
+```
+
+話者 diarization を出す:
+
+```bash
+python3 develop/pyannote_diarize.py /path/to/audio.wav
+```
+
+Whisper の `segments` に話者ラベルを重ねる:
+
+```bash
+python3 develop/pyannote_diarize.py /path/to/audio.wav --whisper-json develop/output/audio.json
+```
+
+## 次工程への接続
+
+- 話者認識: `segments` の時間情報を使って diarization 結果と結合
+- VAD 分割: セグメント単位または VAD 区間単位で再転写
+- LLM 後処理: `json` の低信頼箇所を入力に使う
+
+## 現時点のメモ
+
+- この Whisper 本体には明示的な VAD 分割は入っていません。30 秒窓と `no_speech_threshold` はありますが、独立した VAD ではありません。
+- `pyannote.audio` は導入済みですが、学習済みモデルの取得には Hugging Face へのアクセスが必要です。

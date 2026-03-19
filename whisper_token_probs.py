@@ -86,6 +86,7 @@ def attach_token_probabilities(
     condition_on_previous_text: bool,
     topk: int,
     fp16: bool,
+    reset_key: str | None = None,
 ) -> list[dict[str, Any]]:
     if not segments:
         return segments
@@ -120,7 +121,16 @@ def attach_token_probabilities(
     if current_group:
         grouped_segments.append(current_group)
 
+    current_scope = None
+
     for group in grouped_segments:
+        if reset_key is not None:
+            group_scope = group[0].get(reset_key)
+            if current_scope is None or group_scope != current_scope:
+                all_tokens = initial_prompt_tokens.copy()
+                prompt_reset_since = 0
+                current_scope = group_scope
+
         seek = int(group[0]["seek"])
         sampled_tokens = [token for segment in group for token in segment.get("tokens", [])]
         if not sampled_tokens:

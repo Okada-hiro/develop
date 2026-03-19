@@ -7,7 +7,12 @@ from typing import Any
 
 
 def resolve_hf_token(explicit_token: str | None) -> str:
-    token = explicit_token or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+    token = (
+        explicit_token
+        or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or os.getenv("HUGGINGFACE_TOKEN")
+        or os.getenv("HF_TOKEN")
+    )
     if token:
         return token
     raise SystemExit(
@@ -102,6 +107,132 @@ def merge_speech_regions(
         }
     )
     return chunks
+
+
+def merge_speech_regions_sliding(
+    speech_regions: list[dict[str, Any]],
+    *,
+    target_duration: float,
+    max_duration: float,
+    overlap_duration: float,
+) -> list[dict[str, Any]]:
+    if not speech_regions:
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    timeline_start = speech_regions[0]["start"]
+    timeline_end = speech_regions[-1]["end"]
+    step = max(1.0, target_duration - overlap_duration)
+    cursor = timeline_start
+
+    while cursor < timeline_end:
+        window_end = min(cursor + target_duration, timeline_end)
+        overlapping = [
+            region
+            for region in speech_regions
+            if not (region["end"] <= cursor or region["start"] >= window_end)
+        ]
+        if not overlapping:
+            cursor += step
+            continue
+
+        chunk_start = overlapping[0]["start"]
+        chunk_end = min(max(region["end"] for region in overlapping), chunk_start + max_duration)
+        key = (round(chunk_start, 3), round(chunk_end, 3))
+        if key not in seen and chunk_end > chunk_start:
+            seen.add(key)
+            chunks.append(
+                {
+                    "start": round(chunk_start, 3),
+                    "end": round(chunk_end, 3),
+                    "duration": round(chunk_end - chunk_start, 3),
+                    "speech_region_count": len(overlapping),
+                    "speech_regions": overlapping,
+                }
+            )
+
+        if window_end >= timeline_end:
+            break
+        cursor += step
+
+    return chunks
+
+
+def run_pyannote_vad(
+    *,
+    audio_path: str,
+    hf_token: str,
+    device_name: str,
+    segmentation_model: str,
+    target_duration: float,
+    max_duration: float,
+    strategy: str = "greedy",
+    overlap_duration: float = 5.0,
+) -> dict[str, Any]:
+    import torch
+    from pyannote.audio.pipelines import VoiceActivityDetection
+
+    pipeline = VoiceActivityDetection(
+        segmentation=segmentation_model,
+        use_auth_token=hf_token,
+    )
+    pipeline.to(torch.device(device_name))
+
+    speech = pipeline(audio_path)
+    speech_regions = timeline_to_segments(speech)
+    if strategy == "greedy":
+        chunks = merge_speech_regions(
+            speech_regions,
+            target_duration=target_duration,
+            max_duration=max_duration,
+        )
+    elif strategy == "sliding":
+        chunks = merge_speech_regions_sliding(
+            speech_regions,
+            target_duration=target_duration,
+            max_duration=max_duration,
+            overlap_duration=overlap_duration,
+        )
+    else:
+        raise ValueError(f"Unsupported VAD strategy: {strategy}")
+
+    return {
+        "device": device_name,
+        "segmentation_model": segmentation_model,
+        "target_duration": target_duration,
+        "max_duration": max_duration,
+        "strategy": strategy,
+        "overlap_duration": overlap_duration,
+        "speech_regions": speech_regions,
+        "chunks": chunks,
+    }
+
+
+def run_pyannote_diarization(
+    *,
+    audio_path: str,
+    hf_token: str,
+    device_name: str,
+    pipeline_name: str,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[dict[str, Any]]:
+    import torch
+    from pyannote.audio import Pipeline
+
+    pipeline = Pipeline.from_pretrained(pipeline_name, use_auth_token=hf_token)
+    if pipeline is None:
+        raise RuntimeError("Failed to load pyannote diarization pipeline.")
+    pipeline.to(torch.device(device_name))
+    diarization = pipeline(
+        audio_path,
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+    return annotation_to_turns(diarization)
 
 
 def segment_overlap(start_a: float, end_a: float, start_b: float, end_b: float) -> float:

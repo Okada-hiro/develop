@@ -108,12 +108,14 @@ python3 develop/dual_pass_whisper_pipeline.py /path/to/audio.wav --text-file /pa
   - `sliding`: 20 秒前後
 - pyannote で話者認識する
 - 上位トークン候補と低信頼アラートを JSON に残す
+- 低信頼トークンを連結して low-confidence span を作り、その区間だけ高 `beam_size` で再ASRする
 - 2 通りの転写結果が異なる箇所を `pass_mismatch` アラートとして残す
 - 内部判断用に、セグメント単位の差分も `segment_diff_candidates` に残す
 - `greedy` と `sliding` の transcription を `*.greedy.txt` と `*.sliding.txt` に保存する
 - 話者ごとに見やすくした transcription を JSON の `greedy_by_speaker` / `sliding_by_speaker` に入れ、`*.greedy.by_speaker.txt` と `*.sliding.by_speaker.txt` にも保存する
 - アラート一覧を `*.alerts.txt` に保存し、実行時にも表示する
 - `prompt_generation` を JSON に保存し、実行時にも表示する
+- low-confidence span の再ASR結果を JSON の `low_confidence_rechecks` に保存し、実行時にも表示する
 
 ## 次工程への接続
 

@@ -20,7 +20,11 @@ from pyannote_helpers import (
     resolve_hf_token,
     run_pyannote_diarization,
 )
-from transcript_alerts import attach_token_time_ranges, collect_low_confidence_alerts
+from transcript_alerts import (
+    attach_token_time_ranges,
+    build_low_confidence_spans,
+    collect_low_confidence_alerts,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +45,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--token-topk", type=int, default=5)
     parser.add_argument("--alert-threshold", type=float, default=0.90)
+    parser.add_argument("--recheck-beam-size", type=int, default=10, help="Beam size for low-confidence span re-ASR. Default: 10")
+    parser.add_argument("--recheck-best-of", type=int, default=10, help="Best-of value for low-confidence span re-ASR. Default: 10")
+    parser.add_argument("--recheck-padding", type=float, default=1.0, help="Seconds of left/right padding added to each low-confidence span. Default: 1.0")
+    parser.add_argument("--recheck-merge-gap", type=float, default=0.6, help="Merge neighboring low-confidence tokens into one span when the gap is within this value. Default: 0.6")
     parser.add_argument("--vad-target-duration", type=float, default=30.0)
     parser.add_argument("--vad-max-duration", type=float, default=35.0)
     parser.add_argument("--vad-overlap-duration", type=float, default=5.0)
@@ -250,6 +258,80 @@ def write_text_outputs(
     }
 
 
+def build_recheck_context(segments: list[dict[str, Any]], start: float, end: float) -> dict[str, str]:
+    before_parts: list[str] = []
+    after_parts: list[str] = []
+
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        if not text:
+            continue
+        segment_start = float(segment.get("start", 0.0))
+        segment_end = float(segment.get("end", segment_start))
+        if segment_end <= start:
+            before_parts.append(text)
+        elif segment_start >= end:
+            after_parts.append(text)
+
+    return {
+        "before": " ".join(before_parts[-2:]).strip(),
+        "after": " ".join(after_parts[:2]).strip(),
+    }
+
+
+def run_low_confidence_recheck(
+    *,
+    model: Any,
+    audio_path: Path,
+    result: dict[str, Any],
+    transcribe_options: dict[str, Any],
+    beam_size: int,
+    best_of: int,
+    padding: float,
+    merge_gap: float,
+) -> list[dict[str, Any]]:
+    spans = build_low_confidence_spans(
+        result.get("segments", []),
+        merge_gap=merge_gap,
+        padding=padding,
+    )
+    rechecks: list[dict[str, Any]] = []
+
+    for span in spans:
+        recheck_options = dict(transcribe_options)
+        recheck_options["clip_timestamps"] = f"{span['start']},{span['end']}"
+        recheck_options["beam_size"] = beam_size
+        recheck_options["best_of"] = best_of
+        recheck_options["condition_on_previous_text"] = False
+        recheck_result = model.transcribe(str(audio_path), **recheck_options)
+        context = build_recheck_context(result.get("segments", []), span["start"], span["end"])
+
+        rechecks.append(
+            {
+                "span_index": span["span_index"],
+                "start": span["start"],
+                "end": span["end"],
+                "duration": span["duration"],
+                "raw_start": span["raw_start"],
+                "raw_end": span["raw_end"],
+                "alert_count": span["alert_count"],
+                "segment_ids": span["segment_ids"],
+                "token_text": span["token_text"],
+                "tokens": span["tokens"],
+                "alerts": span["alerts"],
+                "context_before": context["before"],
+                "context_after": context["after"],
+                "beam_size": beam_size,
+                "best_of": best_of,
+                "text": (recheck_result.get("text") or "").strip(),
+                "language": recheck_result.get("language"),
+                "segment_count": len(recheck_result.get("segments", [])),
+            }
+        )
+
+    return rechecks
+
+
 def build_speaker_readable_text(segments: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
     current_speaker: str | None = None
@@ -328,6 +410,19 @@ def format_alerts_for_display(alerts: list[dict[str, Any]]) -> str:
     if not lines:
         return "No alerts.\n"
 
+    return "\n".join(lines) + "\n"
+
+
+def format_rechecks_for_display(pass_name: str, rechecks: list[dict[str, Any]]) -> str:
+    if not rechecks:
+        return f"[{pass_name} recheck]\nNo low-confidence spans.\n"
+
+    lines = [f"[{pass_name} recheck]"]
+    for recheck in rechecks:
+        lines.append(
+            f"- span={recheck['span_index']} time={recheck['start']:.2f}-{recheck['end']:.2f} "
+            f"tokens='{recheck['token_text']}' recheck='{recheck['text']}'"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -421,6 +516,26 @@ def main() -> None:
         alert_threshold=args.alert_threshold,
         fp16=fp16,
     )
+    greedy_rechecks = run_low_confidence_recheck(
+        model=model,
+        audio_path=audio_path,
+        result=greedy_result,
+        transcribe_options=transcribe_options,
+        beam_size=args.recheck_beam_size,
+        best_of=args.recheck_best_of,
+        padding=args.recheck_padding,
+        merge_gap=args.recheck_merge_gap,
+    )
+    sliding_rechecks = run_low_confidence_recheck(
+        model=model,
+        audio_path=audio_path,
+        result=sliding_result,
+        transcribe_options=transcribe_options,
+        beam_size=args.recheck_beam_size,
+        best_of=args.recheck_best_of,
+        padding=args.recheck_padding,
+        merge_gap=args.recheck_merge_gap,
+    )
 
     speaker_turns = run_pyannote_diarization(
         audio_path=str(audio_path),
@@ -449,6 +564,12 @@ def main() -> None:
         "initial_prompt": initial_prompt,
         "alert_threshold": args.alert_threshold,
         "token_topk": args.token_topk,
+        "recheck_settings": {
+            "beam_size": args.recheck_beam_size,
+            "best_of": args.recheck_best_of,
+            "padding": args.recheck_padding,
+            "merge_gap": args.recheck_merge_gap,
+        },
         "speaker_turns": speaker_turns,
         "transcriptions": {
             "greedy": greedy_text,
@@ -460,12 +581,18 @@ def main() -> None:
             "greedy": greedy_result,
             "sliding": sliding_result,
         },
+        "low_confidence_rechecks": {
+            "greedy": greedy_rechecks,
+            "sliding": sliding_rechecks,
+        },
         "diff_candidates": diff_candidates,
         "segment_diff_candidates": segment_diff_candidates,
         "alerts": alerts,
         "alert_summary": {
             "low_confidence_count": sum(1 for alert in alerts if alert["type"] == "low_confidence"),
             "pass_mismatch_count": sum(1 for alert in alerts if alert["type"] == "pass_mismatch"),
+            "greedy_recheck_count": len(greedy_rechecks),
+            "sliding_recheck_count": len(sliding_rechecks),
             "total_count": len(alerts),
         },
     }
@@ -526,6 +653,8 @@ def main() -> None:
     print(sliding_speaker_text)
     print("[alerts]")
     print(alerts_text)
+    print(format_rechecks_for_display("greedy", greedy_rechecks), end="")
+    print(format_rechecks_for_display("sliding", sliding_rechecks), end="")
 
 
 if __name__ == "__main__":

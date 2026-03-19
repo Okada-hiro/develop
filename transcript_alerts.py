@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -9,6 +10,12 @@ def is_visible_output_token(token_text: str | None) -> bool:
     if token_text.startswith("<|") and token_text.endswith("|>"):
         return False
     return bool(token_text.strip())
+
+
+def is_substantive_output_token(token_text: str | None) -> bool:
+    if not is_visible_output_token(token_text):
+        return False
+    return bool(re.search(r"[0-9A-Za-zぁ-んァ-ヴ一-龠々]", token_text or ""))
 
 
 def attach_token_time_ranges(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -84,3 +91,67 @@ def collect_low_confidence_alerts(
             segment["has_alert"] = False
 
     return alerts
+
+
+def build_low_confidence_spans(
+    segments: list[dict[str, Any]],
+    *,
+    merge_gap: float = 0.6,
+    padding: float = 1.0,
+) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    current_span: dict[str, Any] | None = None
+
+    def flush_span() -> None:
+        nonlocal current_span
+        if current_span is None:
+            return
+        raw_start = float(current_span["raw_start"])
+        raw_end = float(current_span["raw_end"])
+        current_span["start"] = max(0.0, round(raw_start - padding, 3))
+        current_span["end"] = round(raw_end + padding, 3)
+        current_span["raw_start"] = round(raw_start, 3)
+        current_span["raw_end"] = round(raw_end, 3)
+        current_span["duration"] = round(current_span["end"] - current_span["start"], 3)
+        spans.append(current_span)
+        current_span = None
+
+    for segment in segments:
+        segment_id = segment.get("id")
+        segment_start = float(segment.get("start", 0.0))
+        segment_end = float(segment.get("end", segment_start))
+
+        for alert in segment.get("alerts", []) or []:
+            token = alert.get("token")
+            if not is_substantive_output_token(token):
+                continue
+
+            token_start = alert.get("time_start")
+            token_end = alert.get("time_end")
+            start = segment_start if token_start is None else float(token_start)
+            end = segment_end if token_end is None else float(token_end)
+
+            if current_span and start - float(current_span["raw_end"]) <= merge_gap:
+                current_span["raw_end"] = max(float(current_span["raw_end"]), end)
+                current_span["segment_ids"].append(segment_id)
+                current_span["tokens"].append(token)
+                current_span["alerts"].append(alert)
+            else:
+                flush_span()
+                current_span = {
+                    "segment_ids": [segment_id],
+                    "raw_start": start,
+                    "raw_end": end,
+                    "tokens": [token],
+                    "alerts": [alert],
+                }
+
+    flush_span()
+
+    for span_index, span in enumerate(spans):
+        span["span_index"] = span_index
+        span["segment_ids"] = list(dict.fromkeys(span["segment_ids"]))
+        span["token_text"] = "".join(span["tokens"])
+        span["alert_count"] = len(span["alerts"])
+
+    return spans

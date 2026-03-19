@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,55 @@ def choose_torch_device(device: str | None) -> str:
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def patch_huggingface_hub_compat() -> None:
+    import huggingface_hub
+
+    signature = inspect.signature(huggingface_hub.hf_hub_download)
+    if "use_auth_token" in signature.parameters:
+        return
+
+    original = huggingface_hub.hf_hub_download
+
+    def wrapped_hf_hub_download(*args, use_auth_token=None, **kwargs):
+        if use_auth_token is not None and "token" not in kwargs:
+            kwargs["token"] = use_auth_token
+        return original(*args, **kwargs)
+
+    huggingface_hub.hf_hub_download = wrapped_hf_hub_download
+
+
+def patch_torch_checkpoint_compat() -> None:
+    import torch
+
+    try:
+        add_safe_globals = torch.serialization.add_safe_globals
+    except AttributeError:
+        return
+
+    safe_globals = [torch.torch_version.TorchVersion]
+    try:
+        from pyannote.audio.core.task import Problem, Specifications
+
+        safe_globals.append(Problem)
+        safe_globals.append(Specifications)
+    except Exception:
+        pass
+
+    add_safe_globals(safe_globals)
+
+    if getattr(torch.load, "_codex_pyannote_patch", False):
+        return
+
+    original_torch_load = torch.load
+
+    def wrapped_torch_load(*args, **kwargs):
+        kwargs["weights_only"] = False
+        return original_torch_load(*args, **kwargs)
+
+    wrapped_torch_load._codex_pyannote_patch = True
+    torch.load = wrapped_torch_load
 
 
 def annotation_to_turns(annotation: Any) -> list[dict[str, Any]]:
@@ -170,6 +220,9 @@ def run_pyannote_vad(
     strategy: str = "greedy",
     overlap_duration: float = 5.0,
 ) -> dict[str, Any]:
+    patch_huggingface_hub_compat()
+    patch_torch_checkpoint_compat()
+
     import torch
     from pyannote.audio.pipelines import VoiceActivityDetection
 
@@ -178,6 +231,12 @@ def run_pyannote_vad(
         use_auth_token=hf_token,
     )
     pipeline.to(torch.device(device_name))
+    pipeline.instantiate(
+        {
+            "min_duration_on": 0.0,
+            "min_duration_off": 0.0,
+        }
+    )
 
     speech = pipeline(audio_path)
     speech_regions = timeline_to_segments(speech)
@@ -219,6 +278,9 @@ def run_pyannote_diarization(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
 ) -> list[dict[str, Any]]:
+    patch_huggingface_hub_compat()
+    patch_torch_checkpoint_compat()
+
     import torch
     from pyannote.audio import Pipeline
 

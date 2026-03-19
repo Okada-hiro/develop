@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 
+def is_visible_output_token(token_text: str | None) -> bool:
+    if not token_text:
+        return False
+    if token_text.startswith("<|") and token_text.endswith("|>"):
+        return False
+    return bool(token_text.strip())
+
+
 def attach_token_time_ranges(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for segment in segments:
         token_infos = segment.get("token_probs", [])
@@ -46,6 +54,10 @@ def collect_low_confidence_alerts(
     for segment in segments:
         segment_alerts = []
         for token_info in segment.get("token_probs", []):
+            token_text = token_info.get("token")
+            if not is_visible_output_token(token_text):
+                continue
+
             probability = float(token_info.get("probability", 1.0))
             if probability >= threshold:
                 continue
@@ -54,7 +66,7 @@ def collect_low_confidence_alerts(
                 "segment_id": segment.get("id"),
                 "segment_start": segment.get("start"),
                 "segment_end": segment.get("end"),
-                "token": token_info.get("token"),
+                "token": token_text,
                 "token_id": token_info.get("token_id"),
                 "probability": probability,
                 "time_start": token_info.get("time_start"),

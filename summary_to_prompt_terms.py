@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from prompt_terms import build_initial_prompt, extract_prompt_terms
+from prompt_terms import DEFAULT_GEMINI_MODEL, build_prompt_package
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +46,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional json output path.",
     )
+    parser.add_argument(
+        "--gemini-api-key",
+        default=None,
+        help="Optional Gemini API key. Falls back to GEMINI_API_KEY / GOOGLE_API_KEY.",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=DEFAULT_GEMINI_MODEL,
+        help=f"Gemini model name. Default: {DEFAULT_GEMINI_MODEL}",
+    )
+    parser.add_argument(
+        "--disable-gemini",
+        action="store_true",
+        help="Disable Gemini-based prompt generation and use regex fallback only.",
+    )
     return parser.parse_args()
 
 
@@ -61,12 +76,16 @@ def main() -> None:
     else:
         summary_text = args.text or args.summary_text or ""
 
-    terms = extract_prompt_terms(summary_text, max_terms=args.max_terms)
-    initial_prompt = build_initial_prompt(terms)
+    prompt_package = build_prompt_package(
+        summary_text,
+        max_terms=args.max_terms,
+        gemini_api_key=args.gemini_api_key,
+        gemini_model=args.gemini_model,
+        use_gemini=not args.disable_gemini,
+    )
     payload = {
         "summary_text": summary_text,
-        "terms": terms,
-        "initial_prompt": initial_prompt,
+        **prompt_package,
     }
 
     if args.output:
